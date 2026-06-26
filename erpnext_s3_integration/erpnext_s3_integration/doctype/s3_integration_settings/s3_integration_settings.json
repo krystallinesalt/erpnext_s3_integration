@@ -13,6 +13,7 @@
         "bucket_name",
         "cb_advanced",
         "folder_prefix",
+        "attachment_subfolder",
         "endpoint_url",
         "use_path_style",
         "sb_actions",
@@ -72,6 +73,13 @@
             "fieldname": "folder_prefix",
             "fieldtype": "Data",
             "label": "Folder Prefix"
+        },
+        {
+            "default": "attachments",
+            "description": "Subfolder used inside the bucket for uploaded attachments (e.g. documents). Only PDF files up to 200 MB are accepted.",
+            "fieldname": "attachment_subfolder",
+            "fieldtype": "Data",
+            "label": "Attachment Subfolder"
         },
         {
             "description": "For MinIO or custom S3 endpoints",

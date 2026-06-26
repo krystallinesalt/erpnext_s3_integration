@@ -6,7 +6,13 @@ from frappe.tests.utils import FrappeTestCase
 
 from erpnext_s3_integration import api
 from erpnext_s3_integration.backup_hooks import cleanup_old_backups
-from erpnext_s3_integration.file_hooks import generate_s3_key
+from erpnext_s3_integration.file_hooks import (
+	before_insert,
+	build_attachment_name,
+	generate_s3_key,
+	on_trash,
+	validate_file_upload,
+)
 from erpnext_s3_integration.s3_client import S3Client
 
 
@@ -52,33 +58,22 @@ class TestS3Integration(FrappeTestCase):
 	@patch("frappe.utils.redis_wrapper.RedisWrapper.lpush")
 	@patch("erpnext_s3_integration.s3_client.S3Client.upload_fileobj")
 	def test_file_upload_hook(self, mock_upload, mock_lpush):
-		# Create a dummy file doc via quick method directly to mimic upload behavior
-		import base64
-
-		# We use frappe.get_doc but ensure content is handled like an upload
 		file_doc = frappe.get_doc(
 			{
 				"doctype": "File",
-				"file_name": "test_s3_upload.txt",
-				"content": b"test content",  # Bytes
+				"file_name": "test_s3_upload.pdf",
+				"content": b"%PDF-1.4\n%test content",
 				"is_private": 1,
+				"attached_to_doctype": "Purchase Invoice",
+				"attached_to_name": "PV-001-2026-INV",
 			}
 		)
 
-		# Bypass frappe's local path validation for S3 urls in tests
-		file_doc.validate_file_path = lambda: None
-		file_doc.validate_file_url = lambda: None
-		file_doc.validate_file_on_disk = lambda: None
+		before_insert(file_doc, "before_insert")
 
-		file_doc.insert()
-
-		# Check if upload was called
 		self.assertTrue(mock_upload.called)
-
-		# Check if file URL was updated appropriately
-		self.assertTrue(file_doc.file_url.startswith("/s3/test-prefix/attachments/private/"))
-
-		# Assert content is cleared so it isn't saved to disk
+		self.assertTrue(file_doc.file_url.startswith("/s3/test-prefix/attachments/private/Purchase_Invoice/PV-001-2026-INV/"))
+		self.assertEqual(file_doc.file_name, "PV-001-2026-INV.pdf")
 		self.assertIsNone(file_doc.content)
 
 	@patch("frappe.utils.redis_wrapper.RedisWrapper.lpush")
@@ -93,22 +88,18 @@ class TestS3Integration(FrappeTestCase):
 		file_doc = frappe.get_doc(
 			{
 				"doctype": "File",
-				"file_name": "test_s3_delete.txt",
-				"content": b"test content",
+				"file_name": "test_s3_delete.pdf",
+				"content": b"%PDF-1.4\n%test content",
 				"is_private": 1,
+				"attached_to_doctype": "Purchase Invoice",
+				"attached_to_name": "PV-001-2026-INV",
 			}
 		)
 
-		file_doc.validate_file_path = lambda: None
-		file_doc.validate_file_url = lambda: None
-		file_doc.validate_file_on_disk = lambda: None
+		before_insert(file_doc, "before_insert")
+		file_doc.file_url = f"/s3/{file_doc.file_url.replace('/s3/', '', 1)}" if file_doc.file_url else None
+		on_trash(file_doc, "on_trash")
 
-		file_doc.insert()
-
-		# Now delete it
-		file_doc.delete()
-
-		# Verify S3 delete was called
 		self.assertTrue(mock_delete.called)
 
 	def test_generate_s3_key(self):
@@ -117,14 +108,72 @@ class TestS3Integration(FrappeTestCase):
 				"doctype": "File",
 				"file_name": "My test file 123.txt",
 				"attached_to_doctype": "Sales Invoice",
+				"attached_to_name": "SI-0001",
 				"is_private": 0,
 			}
 		)
 
 		key = generate_s3_key(file_doc, self.settings)
 		self.assertTrue(key.startswith("test-prefix/attachments/public/"))
-		self.assertIn("/Sales_Invoice/", key)
+		self.assertIn("/Sales_Invoice/SI-0001/", key)
 		self.assertTrue(key.endswith("My_test_file_123.txt"))
+
+	def test_build_attachment_name_uses_version_suffix(self):
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "PV-001-2026-INV.pdf",
+				"attached_to_doctype": "Purchase Invoice",
+				"attached_to_name": "PV-001-2026-INV",
+				"is_private": 0,
+			}
+		)
+
+		existing = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "PV-001-2026-INV.pdf",
+				"attached_to_doctype": "Purchase Invoice",
+				"attached_to_name": "PV-001-2026-INV",
+				"is_private": 0,
+			}
+		)
+		existing.insert(ignore_permissions=True)
+		self.addCleanup(lambda: frappe.delete_doc("File", existing.name, force=1, ignore_permissions=True))
+
+		self.assertEqual(build_attachment_name(file_doc), "PV-001-2026-INV-1.pdf")
+
+	def test_validate_file_upload_rejects_non_pdf(self):
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "invoice.txt",
+				"content": b"not a pdf",
+				"attached_to_doctype": "Purchase Invoice",
+				"attached_to_name": "PV-001-2026-INV",
+				"is_private": 0,
+			}
+		)
+
+		with self.assertRaises(frappe.ValidationError) as exc:
+			validate_file_upload(file_doc)
+		self.assertIn("Only PDF files are allowed", str(exc.exception))
+
+	def test_validate_file_upload_rejects_large_files(self):
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "invoice.pdf",
+				"content": b"%PDF-1.4\n" + b"a" * (200 * 1024 * 1024 + 1),
+				"attached_to_doctype": "Purchase Invoice",
+				"attached_to_name": "PV-001-2026-INV",
+				"is_private": 0,
+			}
+		)
+
+		with self.assertRaises(frappe.ValidationError) as exc:
+			validate_file_upload(file_doc)
+		self.assertIn("200 MB", str(exc.exception))
 
 	@patch("erpnext_s3_integration.s3_client.S3Client.generate_presigned_url")
 	def test_existing_s3_file_access_still_works_when_uploads_disabled(self, mock_generate_presigned_url):
