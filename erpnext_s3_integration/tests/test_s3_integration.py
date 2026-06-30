@@ -143,6 +143,27 @@ class TestS3Integration(FrappeTestCase):
 
 		self.assertEqual(build_attachment_name(file_doc), "PV-001-2026-INV-1.pdf")
 
+	def test_build_attachment_name_applies_prefix_for_sales_and_purchase_documents(self):
+		cases = [
+			{"doctype": "Purchase Invoice", "name": "PI-0001", "expected": "PCHINV-PI-0001.pdf"},
+			{"doctype": "Purchase Credit Note", "name": "PCN-0001", "expected": "PCHCRN-PCN-0001.pdf"},
+			{"doctype": "Sales Invoice", "name": "SI-0001", "expected": "INVETR-SI-0001.pdf"},
+			{"doctype": "Sales Credit Note", "name": "SCN-0001", "expected": "RINETR-SCN-0001.pdf"},
+		]
+
+		for case in cases:
+			file_doc = frappe.get_doc(
+				{
+					"doctype": "File",
+					"file_name": f"{case['name']}.pdf",
+					"attached_to_doctype": case["doctype"],
+					"attached_to_name": case["name"],
+					"is_private": 0,
+				}
+			)
+
+			self.assertEqual(build_attachment_name(file_doc), case["expected"])
+
 	def test_validate_file_upload_rejects_non_pdf(self):
 		file_doc = frappe.get_doc(
 			{

@@ -6,6 +6,13 @@ import frappe
 from frappe import _
 from unidecode import unidecode
 
+ATTACHMENT_PREFIX_BY_DOCTYPE = {
+	"Purchase Invoice": "PCHINV",
+	"Purchase Credit Note": "PCHCRN",
+	"Sales Invoice": "INVETR",
+	"Sales Credit Note": "RINETR",
+}
+
 MAX_ATTACHMENT_SIZE_BYTES = 200 * 1024 * 1024
 
 
@@ -26,8 +33,12 @@ def _get_attachment_subfolder(settings):
 def build_attachment_name(file_doc):
 	"""Build a deterministic attachment name using the parent document name and versioning."""
 	attached_to_name = getattr(file_doc, "attached_to_name", None)
+	attached_to_doctype = getattr(file_doc, "attached_to_doctype", None)
 	if attached_to_name:
 		base_name = _slugify(attached_to_name)
+		prefix = ATTACHMENT_PREFIX_BY_DOCTYPE.get(attached_to_doctype)
+		if prefix:
+			base_name = f"{prefix}-{base_name}"
 		ext = os.path.splitext(getattr(file_doc, "file_name", "") or "")[1] or ".pdf"
 		if not ext:
 			ext = ".pdf"
@@ -35,7 +46,7 @@ def build_attachment_name(file_doc):
 			ext = ".pdf"
 
 		version = 0
-		if getattr(file_doc, "attached_to_doctype", None) and attached_to_name:
+		if attached_to_doctype and attached_to_name:
 			existing_files = frappe.get_all(
 				"File",
 				filters={
@@ -121,7 +132,6 @@ def generate_s3_key(file_doc, settings):
 				f"{file_doc.content_hash}-{filename}" if getattr(file_doc, "content_hash", None) else filename
 			)
 			path_parts.append(identifier)
-
 		path_parts.append(attachment_name)
 		base_path = "/".join(path_parts)
 
