@@ -3,4 +3,6 @@
 # Read docs to understand patches: https://frappeframework.com/docs/v14/user/en/database-migrations
 
 [post_model_sync]
+# ERPNext S3 Integration: Add Pdf Copy fields to key documents
+erpnext_s3_integration.patches.v16_0.add_pdf_copy_custom_fields
 # Patches added in this section will be executed after doctypes are migrated

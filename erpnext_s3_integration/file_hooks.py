@@ -9,6 +9,7 @@ from unidecode import unidecode
 ATTACHMENT_PREFIX_BY_DOCTYPE = {
 	"Purchase Invoice": "PCHINV",
 	"Purchase Credit Note": "PCHCRN",
+	"Purchase Order": "PURPQT",
 	"Sales Invoice": "INVETR",
 	"Sales Credit Note": "RINETR",
 }
@@ -30,6 +31,27 @@ def _get_attachment_subfolder(settings):
 	return subfolder or "attachments"
 
 
+def _get_s3_settings():
+	frappe.clear_cache(doctype="S3 Integration Settings")
+	return frappe.get_doc("S3 Integration Settings", "S3 Integration Settings")
+
+
+def _sync_parent_pdf_copy_field(file_doc):
+	attached_to_field = (getattr(file_doc, "attached_to_field", None) or "").strip()
+	if attached_to_field != "pdf_copy":
+		return
+
+	attached_to_doctype = getattr(file_doc, "attached_to_doctype", None)
+	attached_to_name = getattr(file_doc, "attached_to_name", None)
+	if not attached_to_doctype or not attached_to_name:
+		return
+
+	if getattr(file_doc, "name", None):
+		file_doc.db_set("attached_to_field", "pdf_copy")
+
+	frappe.db.set_value(attached_to_doctype, attached_to_name, "pdf_copy", file_doc.file_url)
+
+
 def build_attachment_name(file_doc):
 	"""Build a deterministic attachment name using the parent document name and versioning."""
 	attached_to_name = getattr(file_doc, "attached_to_name", None)
@@ -47,6 +69,7 @@ def build_attachment_name(file_doc):
 
 		version = 0
 		if attached_to_doctype and attached_to_name:
+			slugged_name = _slugify(attached_to_name)
 			existing_files = frappe.get_all(
 				"File",
 				filters={
@@ -54,14 +77,22 @@ def build_attachment_name(file_doc):
 					"attached_to_name": attached_to_name,
 				},
 				fields=["file_name"],
-				limit_page_length=1000,
+				limit=1000,
 			)
 			for row in existing_files:
 				existing_name = (row.get("file_name") or "").strip()
 				if not existing_name:
 					continue
 				existing_base, _ = os.path.splitext(existing_name)
+				if not existing_base:
+					continue
 				if existing_base == base_name or existing_base.startswith(f"{base_name}-"):
+					version += 1
+				elif prefix and existing_base == slugged_name:
+					version += 1
+				elif prefix and existing_base.startswith(f"{prefix}-{slugged_name}-"):
+					version += 1
+				elif existing_base.startswith(f"{slugged_name}-"):
 					version += 1
 
 		if version:
@@ -72,6 +103,59 @@ def build_attachment_name(file_doc):
 	if not default_name.lower().endswith(".pdf"):
 		default_name = f"{os.path.splitext(default_name)[0]}.pdf"
 	return default_name
+
+
+def rename_attachment_to_final_name(file_doc, settings=None):
+	"""Rename an S3-backed attachment once the parent document has a real final name."""
+	if not getattr(file_doc, "file_url", None) or not file_doc.file_url.startswith("/s3/"):
+		return False
+
+	if settings is None:
+		settings = _get_s3_settings()
+	if not getattr(settings, "enable_attachments_s3", False):
+		return False
+
+	target_name = build_attachment_name(file_doc)
+	target_key = generate_s3_key(file_doc, settings)
+	current_key = file_doc.file_url.replace("/s3/", "", 1)
+	current_name = getattr(file_doc, "file_name", None) or ""
+
+	if current_name == target_name and current_key == target_key:
+		_sync_parent_pdf_copy_field(file_doc)
+		return False
+
+	from erpnext_s3_integration.s3_client import S3Client
+
+	s3_client = S3Client()
+	s3_client.move_object(current_key, target_key, is_public=not file_doc.is_private)
+
+	file_doc.file_name = target_name
+	file_doc.file_url = f"/s3/{target_key}"
+	if getattr(file_doc, "name", None):
+		file_doc.db_set("file_name", target_name)
+		file_doc.db_set("file_url", file_doc.file_url)
+	_sync_parent_pdf_copy_field(file_doc)
+	return True
+
+
+def rename_attached_files_for_parent(doc, method=None):
+	"""Rename any S3-backed attachments linked to a parent document after the parent gets its final name."""
+	if not getattr(doc, "name", None) or str(doc.name).startswith("new-"):
+		return
+
+	settings = _get_s3_settings()
+	if not getattr(settings, "enable_attachments_s3", False):
+		return
+
+	files = frappe.get_all(
+		"File",
+		filters={"attached_to_doctype": doc.doctype, "attached_to_name": doc.name},
+		fields=["name"],
+		limit_page_length=1000,
+	)
+	for row in files:
+		file_doc = frappe.get_doc("File", row.name)
+		rename_attachment_to_final_name(file_doc, settings=settings)
 
 
 def validate_file_upload(file_doc):
@@ -140,25 +224,38 @@ def generate_s3_key(file_doc, settings):
 
 def before_insert(file_doc, method):
 	"""Intercept file insertion to upload to S3."""
-	settings = frappe.get_single("S3 Integration Settings")
+	if getattr(getattr(file_doc, "flags", None), "s3_before_insert_run", False):
+		return True
+
+	if getattr(file_doc, "file_url", None) and file_doc.file_url.startswith("/s3/"):
+		file_doc.flags.s3_before_insert_run = True
+		return True
+
+	settings = _get_s3_settings()
 	if not settings.enable_attachments_s3:
-		return
+		return False
 
 	# Only intercept if it's a new upload with content
 	if (
 		hasattr(file_doc, "is_file_path") and file_doc.is_file_path() and not frappe.flags.in_test
 	) or getattr(file_doc, "is_folder", False):
-		return
+		return False
 
 	validate_file_upload(file_doc)
 
 	# If no content was provided during insert but they uploaded a file, Frappe triggers `save_file`
 	# Which writes to disk. We need to handle this by checking if the content exists.
-	content = file_doc.get_content()
+	try:
+		content = file_doc.get_content()
+	except (FileNotFoundError, OSError):
+		file_doc.flags.s3_before_insert_run = True
+		return True
 	if not content and not frappe.flags.in_test:
-		return
+		return False
 
 	from erpnext_s3_integration.s3_client import S3Client
+
+	file_doc.flags.s3_before_insert_run = True
 
 	try:
 		s3_client = S3Client()
@@ -179,10 +276,12 @@ def before_insert(file_doc, method):
 	except Exception as e:
 		frappe.throw(f"Error uploading file to S3: {e}")
 
+	return True
+
 
 def on_trash(file_doc, method):
 	"""Handle deletion from S3."""
-	settings = frappe.get_single("S3 Integration Settings")
+	settings = _get_s3_settings()
 	if not settings.enable_attachments_s3 or not settings.delete_from_s3_on_file_delete:
 		return
 

@@ -3,6 +3,14 @@ from frappe.core.doctype.file.file import File
 
 
 class CustomFile(File):
+	def before_insert(self):
+		from erpnext_s3_integration.file_hooks import before_insert as s3_before_insert
+
+		handled = s3_before_insert(self, "before_insert")
+		if handled:
+			return
+		super().before_insert()
+
 	def get_content(self, encodings=None) -> bytes | str:
 		if self.file_url and self.file_url.startswith("/s3/"):
 			if self.get("content"):
@@ -64,6 +72,8 @@ class CustomFile(File):
 
 	def validate_file_on_disk(self):
 		if self.file_url and self.file_url.startswith("/s3/"):
+			return True
+		if not getattr(self, "file_url", None):
 			return True
 		return super().validate_file_on_disk()
 

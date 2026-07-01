@@ -11,6 +11,7 @@ from erpnext_s3_integration.file_hooks import (
 	build_attachment_name,
 	generate_s3_key,
 	on_trash,
+	rename_attachment_to_final_name,
 	validate_file_upload,
 )
 from erpnext_s3_integration.s3_client import S3Client
@@ -24,6 +25,7 @@ class TestS3Integration(FrappeTestCase):
 		self.settings.region_name = "us-east-1"
 		self.settings.bucket_name = "test-bucket"
 		self.settings.folder_prefix = "test-prefix"
+		self.settings.attachment_subfolder = "attachments"
 		self.settings.enable_attachments_s3 = 1
 		self.settings.delete_from_s3_on_file_delete = 1
 
@@ -73,7 +75,7 @@ class TestS3Integration(FrappeTestCase):
 
 		self.assertTrue(mock_upload.called)
 		self.assertTrue(file_doc.file_url.startswith("/s3/test-prefix/attachments/private/Purchase_Invoice/PV-001-2026-INV/"))
-		self.assertEqual(file_doc.file_name, "PV-001-2026-INV.pdf")
+		self.assertEqual(file_doc.file_name, "PCHINV-PV-001-2026-INV.pdf")
 		self.assertIsNone(file_doc.content)
 
 	@patch("frappe.utils.redis_wrapper.RedisWrapper.lpush")
@@ -116,7 +118,7 @@ class TestS3Integration(FrappeTestCase):
 		key = generate_s3_key(file_doc, self.settings)
 		self.assertTrue(key.startswith("test-prefix/attachments/public/"))
 		self.assertIn("/Sales_Invoice/SI-0001/", key)
-		self.assertTrue(key.endswith("My_test_file_123.txt"))
+		self.assertTrue(key.endswith("INVETR-SI-0001.pdf"))
 
 	def test_build_attachment_name_uses_version_suffix(self):
 		file_doc = frappe.get_doc(
@@ -141,12 +143,13 @@ class TestS3Integration(FrappeTestCase):
 		existing.insert(ignore_permissions=True)
 		self.addCleanup(lambda: frappe.delete_doc("File", existing.name, force=1, ignore_permissions=True))
 
-		self.assertEqual(build_attachment_name(file_doc), "PV-001-2026-INV-1.pdf")
+		self.assertEqual(build_attachment_name(file_doc), "PCHINV-PV-001-2026-INV-1.pdf")
 
 	def test_build_attachment_name_applies_prefix_for_sales_and_purchase_documents(self):
 		cases = [
 			{"doctype": "Purchase Invoice", "name": "PI-0001", "expected": "PCHINV-PI-0001.pdf"},
 			{"doctype": "Purchase Credit Note", "name": "PCN-0001", "expected": "PCHCRN-PCN-0001.pdf"},
+			{"doctype": "Purchase Order", "name": "PO-0001", "expected": "PURPQT-PO-0001.pdf"},
 			{"doctype": "Sales Invoice", "name": "SI-0001", "expected": "INVETR-SI-0001.pdf"},
 			{"doctype": "Sales Credit Note", "name": "SCN-0001", "expected": "RINETR-SCN-0001.pdf"},
 		]
@@ -163,6 +166,53 @@ class TestS3Integration(FrappeTestCase):
 			)
 
 			self.assertEqual(build_attachment_name(file_doc), case["expected"])
+
+	@patch("erpnext_s3_integration.s3_client.S3Client.move_object")
+	def test_rename_attachment_to_final_name_updates_pdf_copy_field(self, mock_move_object):
+		parent = frappe.get_doc({"doctype": "Purchase Invoice"})
+		parent.flags.ignore_mandatory = True
+		parent.insert(ignore_permissions=True)
+		self.addCleanup(lambda: frappe.delete_doc("Purchase Invoice", parent.name, force=1, ignore_permissions=True))
+
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "temp.pdf",
+				"file_url": "/s3/test-prefix/attachments/private/Purchase_Invoice/new-purchase-invoice/temp.pdf",
+				"attached_to_doctype": "Purchase Invoice",
+				"attached_to_name": parent.name,
+				"attached_to_field": "pdf_copy",
+				"is_private": 1,
+			}
+		)
+		file_doc.insert(ignore_permissions=True)
+		self.addCleanup(lambda: frappe.delete_doc("File", file_doc.name, force=1, ignore_permissions=True))
+
+		rename_attachment_to_final_name(file_doc, self.settings)
+
+		self.assertEqual(frappe.db.get_value("Purchase Invoice", parent.name, "pdf_copy"), file_doc.file_url)
+		self.assertEqual(file_doc.attached_to_field, "pdf_copy")
+		mock_move_object.assert_called_once()
+
+	@patch("erpnext_s3_integration.s3_client.S3Client.move_object")
+	def test_rename_attachment_to_final_name_uses_parent_doc_name(self, mock_move_object):
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "temp.pdf",
+				"file_url": "/s3/test-prefix/attachments/private/Purchase_Invoice/new-purchase-invoice/temp.pdf",
+				"attached_to_doctype": "Purchase Invoice",
+				"attached_to_name": "new-purchase-invoice",
+				"is_private": 1,
+			}
+		)
+
+		file_doc.attached_to_name = "PI-0001"
+		rename_attachment_to_final_name(file_doc, self.settings)
+
+		self.assertEqual(file_doc.file_name, "PCHINV-PI-0001.pdf")
+		self.assertTrue(file_doc.file_url.startswith("/s3/test-prefix/attachments/private/Purchase_Invoice/PI-0001/"))
+		mock_move_object.assert_called_once()
 
 	def test_validate_file_upload_rejects_non_pdf(self):
 		file_doc = frappe.get_doc(
@@ -212,7 +262,6 @@ class TestS3Integration(FrappeTestCase):
 				"is_private": 0,
 			}
 		).insert(ignore_permissions=True)
-
 		self.addCleanup(lambda: frappe.delete_doc("File", file_doc.name, force=1, ignore_permissions=True))
 
 		frappe.local.form_dict = frappe._dict({"key": "test-prefix/existing_on_s3.txt"})

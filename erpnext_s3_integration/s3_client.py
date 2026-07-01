@@ -116,6 +116,43 @@ class S3Client:
 			frappe.log_error(message=frappe.get_traceback(), title=f"S3 Upload Failed for {key}")
 			raise frappe.ValidationError(f"Could not upload file to S3: {e}")
 
+	def copy_object(self, source_key, destination_key, is_public=False):
+		_, client_error = _load_boto3()
+		extra_args = {}
+		if is_public:
+			extra_args["ACL"] = "public-read"
+
+		try:
+			self._client.copy_object(
+				Bucket=self.bucket_name,
+				CopySource={"Bucket": self.bucket_name, "Key": source_key},
+				Key=destination_key,
+				**extra_args,
+			)
+			return True
+		except client_error as e:
+			error_code = (e.response or {}).get("Error", {}).get("Code")
+			if error_code == "AccessControlListNotSupported" and "ACL" in extra_args:
+				try:
+					self._client.copy_object(
+						Bucket=self.bucket_name,
+						CopySource={"Bucket": self.bucket_name, "Key": source_key},
+						Key=destination_key,
+					)
+					return True
+				except Exception:
+					pass
+			frappe.log_error(message=frappe.get_traceback(), title=f"S3 Copy Failed for {source_key} -> {destination_key}")
+			raise frappe.ValidationError(f"Could not copy file on S3: {e}")
+		except Exception as e:
+			frappe.log_error(message=frappe.get_traceback(), title=f"S3 Copy Failed for {source_key} -> {destination_key}")
+			raise frappe.ValidationError(f"Could not copy file on S3: {e}")
+
+	def move_object(self, source_key, destination_key, is_public=False):
+		self.copy_object(source_key, destination_key, is_public=is_public)
+		self.delete_object(source_key)
+		return True
+
 	def delete_object(self, key):
 		try:
 			self._client.delete_object(Bucket=self.bucket_name, Key=key)

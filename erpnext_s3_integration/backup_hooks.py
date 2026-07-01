@@ -94,6 +94,8 @@ def cleanup_old_backups(s3_client, prefix, retention_days):
 	import datetime
 
 	cutoff_date = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=retention_days)
+	if cutoff_date.tzinfo is not None:
+		cutoff_date = cutoff_date.replace(tzinfo=None)
 	deleted_count = 0
 
 	try:
@@ -101,7 +103,10 @@ def cleanup_old_backups(s3_client, prefix, retention_days):
 		for page in paginator.paginate(Bucket=s3_client.bucket_name, Prefix=prefix):
 			if "Contents" in page:
 				for obj in page["Contents"]:
-					if obj["LastModified"] < cutoff_date:
+					last_modified = obj["LastModified"]
+					if getattr(last_modified, "tzinfo", None) is not None:
+						last_modified = last_modified.replace(tzinfo=None)
+					if last_modified < cutoff_date:
 						s3_client.delete_object(obj["Key"])
 						deleted_count += 1
 

@@ -50,6 +50,15 @@ def execute():
 				"insert_after": "supplier_name",
 			},
 		],
+		"Purchase Order": [
+			{
+				"fieldname": "pdf_copy",
+				"fieldtype": "Attach",
+				"label": "Pdf Copy",
+				"options": "File",
+				"insert_after": "supplier_name",
+			},
+		],
 		"Purchase Receipt": [
 			{
 				"fieldname": "pdf_copy",
