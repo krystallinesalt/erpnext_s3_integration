@@ -195,6 +195,47 @@ class TestS3Integration(FrappeTestCase):
 		mock_move_object.assert_called_once()
 
 	@patch("erpnext_s3_integration.s3_client.S3Client.move_object")
+	def test_rename_attachment_to_final_name_is_idempotent_once_finalized(self, mock_move_object):
+		# rename_attached_files_for_parent reprocesses every attached File on every save of
+		# the parent, not just the newly uploaded one. Once a file has its deterministic
+		# final name, reprocessing it again must be a no-op - build_attachment_name's version
+		# suffix is based on a live sibling count that shifts over time, and recomputing it on
+		# an already-settled file would otherwise move it to a new S3 key on every subsequent
+		# save for no reason.
+		parent = frappe.get_doc({"doctype": "Purchase Invoice"})
+		parent.flags.ignore_mandatory = True
+		parent.insert(ignore_permissions=True)
+		self.addCleanup(lambda: frappe.delete_doc("Purchase Invoice", parent.name, force=1, ignore_permissions=True))
+
+		file_doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "temp.pdf",
+				"file_url": "/s3/test-prefix/attachments/private/Purchase_Invoice/new-purchase-invoice/temp.pdf",
+				"attached_to_doctype": "Purchase Invoice",
+				"attached_to_name": parent.name,
+				"attached_to_field": "pdf_copy",
+				"is_private": 1,
+			}
+		)
+		file_doc.insert(ignore_permissions=True)
+		self.addCleanup(lambda: frappe.delete_doc("File", file_doc.name, force=1, ignore_permissions=True))
+
+		rename_attachment_to_final_name(file_doc, self.settings)
+		self.assertEqual(mock_move_object.call_count, 1)
+
+		finalized_name = frappe.db.get_value("File", file_doc.name, "file_name")
+		finalized_url = frappe.db.get_value("File", file_doc.name, "file_url")
+
+		# Simulate a later, unrelated save of the parent reprocessing this same file again.
+		refreshed = frappe.get_doc("File", file_doc.name)
+		rename_attachment_to_final_name(refreshed, self.settings)
+
+		self.assertEqual(mock_move_object.call_count, 1)
+		self.assertEqual(frappe.db.get_value("File", file_doc.name, "file_name"), finalized_name)
+		self.assertEqual(frappe.db.get_value("File", file_doc.name, "file_url"), finalized_url)
+
+	@patch("erpnext_s3_integration.s3_client.S3Client.move_object")
 	def test_rename_attachment_to_final_name_uses_parent_doc_name(self, mock_move_object):
 		file_doc = frappe.get_doc(
 			{

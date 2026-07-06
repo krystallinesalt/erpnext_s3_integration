@@ -16,6 +16,18 @@ ATTACHMENT_PREFIX_BY_DOCTYPE = {
 
 MAX_ATTACHMENT_SIZE_BYTES = 200 * 1024 * 1024
 
+PDF_COPY_FIELDNAME = "pdf_copy"
+
+PDF_COPY_ATTACHMENT_DOCTYPES = (
+	"Purchase Invoice",
+	"Purchase Credit Note",
+	"Purchase Order",
+	"Purchase Receipt",
+	"Sales Invoice",
+	"Sales Credit Note",
+	"Supplier Quotation",
+)
+
 
 def _slugify(value):
 	if not value:
@@ -36,20 +48,30 @@ def _get_s3_settings():
 	return frappe.get_doc("S3 Integration Settings", "S3 Integration Settings")
 
 
-def _sync_parent_pdf_copy_field(file_doc):
-	attached_to_field = (getattr(file_doc, "attached_to_field", None) or "").strip()
-	if attached_to_field != "pdf_copy":
-		return
+def _sync_attachment_tracking(file_doc):
+	"""Create/refresh the S3 PDF Attachment tracking row and keep the parent's pdf_copy
+	pointer in sync. This is the single place that owns pdf_copy going forward — it is
+	status-aware (won't resurrect an attachment the user has soft-deleted), unlike a plain
+	unconditional field write would be."""
+	from erpnext_s3_integration.attachment_tracking import sync_after_upload
 
-	attached_to_doctype = getattr(file_doc, "attached_to_doctype", None)
-	attached_to_name = getattr(file_doc, "attached_to_name", None)
-	if not attached_to_doctype or not attached_to_name:
-		return
+	sync_after_upload(file_doc)
 
-	if getattr(file_doc, "name", None):
-		file_doc.db_set("attached_to_field", "pdf_copy")
 
-	frappe.db.set_value(attached_to_doctype, attached_to_name, "pdf_copy", file_doc.file_url)
+def _base_attachment_name(attached_to_doctype, attached_to_name):
+	base_name = _slugify(attached_to_name)
+	prefix = ATTACHMENT_PREFIX_BY_DOCTYPE.get(attached_to_doctype)
+	if prefix:
+		base_name = f"{prefix}-{base_name}"
+	return base_name
+
+
+def _matches_finalized_base_name(file_name, base_name):
+	"""Whether file_name already looks like <base_name>.pdf or <base_name>-<n>.pdf."""
+	current_base, _ext = os.path.splitext((file_name or "").strip())
+	if not current_base:
+		return False
+	return current_base == base_name or current_base.startswith(f"{base_name}-")
 
 
 def build_attachment_name(file_doc):
@@ -57,10 +79,8 @@ def build_attachment_name(file_doc):
 	attached_to_name = getattr(file_doc, "attached_to_name", None)
 	attached_to_doctype = getattr(file_doc, "attached_to_doctype", None)
 	if attached_to_name:
-		base_name = _slugify(attached_to_name)
 		prefix = ATTACHMENT_PREFIX_BY_DOCTYPE.get(attached_to_doctype)
-		if prefix:
-			base_name = f"{prefix}-{base_name}"
+		base_name = _base_attachment_name(attached_to_doctype, attached_to_name)
 		ext = os.path.splitext(getattr(file_doc, "file_name", "") or "")[1] or ".pdf"
 		if not ext:
 			ext = ".pdf"
@@ -115,13 +135,28 @@ def rename_attachment_to_final_name(file_doc, settings=None):
 	if not getattr(settings, "enable_attachments_s3", False):
 		return False
 
+	# Once a file already carries its deterministic final name, leave it alone for good.
+	# build_attachment_name's version suffix is based on a live count of sibling attachments,
+	# which naturally shifts as more files are added/removed later - recomputing it on every
+	# subsequent save (rename_attached_files_for_parent reprocesses every attached file on
+	# every parent save, not just the newly uploaded one) would keep moving an already-settled
+	# file to a new S3 key for no reason, and risks losing it if a copy/delete step ever fails
+	# partway.
+	attached_to_doctype = getattr(file_doc, "attached_to_doctype", None)
+	attached_to_name = getattr(file_doc, "attached_to_name", None)
+	if getattr(file_doc, "name", None) and attached_to_name:
+		base_name = _base_attachment_name(attached_to_doctype, attached_to_name)
+		if _matches_finalized_base_name(getattr(file_doc, "file_name", None), base_name):
+			_sync_attachment_tracking(file_doc)
+			return False
+
 	target_name = build_attachment_name(file_doc)
 	target_key = generate_s3_key(file_doc, settings)
 	current_key = file_doc.file_url.replace("/s3/", "", 1)
 	current_name = getattr(file_doc, "file_name", None) or ""
 
 	if current_name == target_name and current_key == target_key:
-		_sync_parent_pdf_copy_field(file_doc)
+		_sync_attachment_tracking(file_doc)
 		return False
 
 	from erpnext_s3_integration.s3_client import S3Client
@@ -129,12 +164,20 @@ def rename_attachment_to_final_name(file_doc, settings=None):
 	s3_client = S3Client()
 	s3_client.move_object(current_key, target_key, is_public=not file_doc.is_private)
 
+	# move_object is an immediate, irreversible external side effect (S3 copy + delete) that
+	# is not part of the surrounding DB transaction. If anything later in this request fails
+	# and the transaction rolls back, the DB would revert to pointing at a key that no longer
+	# exists on S3 while the real object now sits under target_key - a dangling reference with
+	# no code path back to it. Commit immediately so the DB is never out of sync with the S3
+	# side effect that has already, unconditionally, happened.
 	file_doc.file_name = target_name
 	file_doc.file_url = f"/s3/{target_key}"
 	if getattr(file_doc, "name", None):
 		file_doc.db_set("file_name", target_name)
 		file_doc.db_set("file_url", file_doc.file_url)
-	_sync_parent_pdf_copy_field(file_doc)
+	_sync_attachment_tracking(file_doc)
+	if not frappe.flags.in_test:
+		frappe.db.commit()
 	return True
 
 
@@ -253,6 +296,12 @@ def before_insert(file_doc, method):
 	if not content and not frappe.flags.in_test:
 		return False
 
+	attached_to_field = (getattr(file_doc, "attached_to_field", None) or "").strip()
+	if attached_to_field == PDF_COPY_FIELDNAME:
+		from erpnext_s3_integration.attachment_tracking import reject_if_duplicate_pdf_attachment
+
+		reject_if_duplicate_pdf_attachment(file_doc, content)
+
 	from erpnext_s3_integration.s3_client import S3Client
 
 	file_doc.flags.s3_before_insert_run = True
@@ -281,6 +330,14 @@ def before_insert(file_doc, method):
 
 def on_trash(file_doc, method):
 	"""Handle deletion from S3."""
+	if frappe.db.exists("S3 PDF Attachment", {"file": file_doc.name}) and "System Manager" not in frappe.get_roles():
+		frappe.throw(
+			_(
+				"This file is tracked as a PDF attachment. Please use the Delete action in the "
+				"document's Attachments card instead of removing it from here."
+			)
+		)
+
 	settings = _get_s3_settings()
 	if not settings.enable_attachments_s3 or not settings.delete_from_s3_on_file_delete:
 		return

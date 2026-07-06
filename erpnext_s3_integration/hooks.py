@@ -33,6 +33,16 @@ doc_events = {
 	},
 }
 
+doctype_js = {
+	"Purchase Invoice": "public/js/pdf_attachments_card.js",
+	"Purchase Credit Note": "public/js/pdf_attachments_card.js",
+	"Purchase Order": "public/js/pdf_attachments_card.js",
+	"Purchase Receipt": "public/js/pdf_attachments_card.js",
+	"Sales Invoice": "public/js/pdf_attachments_card.js",
+	"Sales Credit Note": "public/js/pdf_attachments_card.js",
+	"Supplier Quotation": "public/js/pdf_attachments_card.js",
+}
+
 scheduler_events = {"all": ["erpnext_s3_integration.backup_hooks.scheduled_backup_and_sync"]}
 
 extend_doctype_class = {"File": "erpnext_s3_integration.overrides.file.CustomFile"}
