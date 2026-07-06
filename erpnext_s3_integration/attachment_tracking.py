@@ -1,5 +1,8 @@
+from urllib.parse import quote
+
 import frappe
 from frappe import _
+from frappe.utils import escape_html
 from frappe.utils.file_manager import get_content_hash
 
 from erpnext_s3_integration.file_hooks import PDF_COPY_ATTACHMENT_DOCTYPES, PDF_COPY_FIELDNAME
@@ -13,6 +16,39 @@ def _validate_supported_doctype(doctype):
 def _lock_parent(doctype, docname):
 	"""Serialize concurrent attach/delete/restore calls against the same parent document."""
 	frappe.db.get_value(doctype, docname, "name", for_update=True)
+
+
+def _record_attachment_activity(tracking, action):
+	"""Record a soft-delete/restore action on the parent document's Activity Log (a queryable
+	audit trail) and its own timeline (a Comment, using the same comment_type Frappe's native
+	attach/remove flow already uses - see File.create_attachment_record/on_trash). These
+	actions bypass that native flow entirely, so without this they'd leave no trace anywhere.
+	"""
+	if action == "delete":
+		subject = _("Deleted PDF attachment {0}").format(frappe.bold(tracking.file_name))
+		comment_type = "Attachment Removed"
+		comment_text = tracking.file_name
+	else:
+		subject = _("Restored PDF attachment {0}").format(frappe.bold(tracking.file_name))
+		comment_type = "Attachment"
+		file_url = quote(frappe.safe_encode(tracking.file_url), safe="/:") if tracking.file_url else ""
+		comment_text = _("Restored: <a href='{0}' target='_blank'>{1}</a>").format(
+			file_url, escape_html(tracking.file_name)
+		)
+
+	frappe.get_doc(
+		{
+			"doctype": "Activity Log",
+			"subject": subject,
+			"user": frappe.session.user,
+			"reference_doctype": tracking.attached_to_doctype,
+			"reference_name": tracking.attached_to_name,
+		}
+	).insert(ignore_permissions=True)
+
+	frappe.get_doc(tracking.attached_to_doctype, tracking.attached_to_name).add_comment(
+		comment_type, comment_text
+	)
 
 
 def reject_if_duplicate_pdf_attachment(file_doc, content):
@@ -176,6 +212,7 @@ def soft_delete_pdf_attachment(name):
 			None,
 			update_modified=False,
 		)
+		_record_attachment_activity(tracking, "delete")
 
 	return get_attachment_history(tracking.attached_to_doctype, tracking.attached_to_name)
 
@@ -191,5 +228,6 @@ def restore_pdf_attachment(name):
 		frappe.throw(_("The underlying file no longer exists and cannot be restored."))
 
 	_activate(name, tracking.attached_to_doctype, tracking.attached_to_name)
+	_record_attachment_activity(tracking, "restore")
 
 	return get_attachment_history(tracking.attached_to_doctype, tracking.attached_to_name)

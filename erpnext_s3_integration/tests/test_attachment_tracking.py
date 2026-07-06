@@ -124,6 +124,50 @@ class TestAttachmentTracking(FrappeTestCase):
 		self.assertIsNone(history["active"])
 		self.assertEqual(len(history["deleted"]), 1)
 
+	def test_soft_delete_and_restore_are_logged_to_activity_log_and_timeline(self):
+		file_doc = self._make_file("a.pdf", "/s3/a.pdf")
+		sync_after_upload(file_doc)
+		tracking_name = frappe.db.get_value("S3 PDF Attachment", {"file": file_doc.name}, "name")
+
+		soft_delete_pdf_attachment(tracking_name)
+		restore_pdf_attachment(tracking_name)
+
+		logs = frappe.get_all(
+			"Activity Log",
+			filters={
+				"reference_doctype": "Purchase Invoice",
+				"reference_name": self.parent.name,
+			},
+			fields=["subject"],
+			order_by="creation asc",
+		)
+		self.addCleanup(
+			lambda: [
+				frappe.delete_doc("Activity Log", log.name, force=1, ignore_permissions=True)
+				for log in frappe.get_all(
+					"Activity Log",
+					filters={"reference_doctype": "Purchase Invoice", "reference_name": self.parent.name},
+				)
+			]
+		)
+
+		self.assertEqual(len(logs), 2)
+		self.assertIn("Deleted", logs[0].subject)
+		self.assertIn("Restored", logs[1].subject)
+
+		# File.create_attachment_record already adds one native "Attachment" comment when the
+		# file is first inserted - only assert on the delete/restore comments added on top of it.
+		comments = frappe.get_all(
+			"Comment",
+			filters={"reference_doctype": "Purchase Invoice", "reference_name": self.parent.name},
+			fields=["comment_type", "content"],
+			order_by="creation asc",
+		)
+		self.assertEqual(comments[-2].comment_type, "Attachment Removed")
+		self.assertEqual(comments[-2].content, "a.pdf")
+		self.assertEqual(comments[-1].comment_type, "Attachment")
+		self.assertIn("Restored", comments[-1].content)
+
 	def test_restore_demotes_current_active(self):
 		first = self._make_file("a.pdf", "/s3/a.pdf")
 		sync_after_upload(first)
