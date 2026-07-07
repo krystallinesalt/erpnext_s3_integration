@@ -58,9 +58,29 @@ def _sync_attachment_tracking(file_doc):
 	sync_after_upload(file_doc)
 
 
+RETURN_PREFIX_BY_DOCTYPE = {
+	"Sales Invoice": ATTACHMENT_PREFIX_BY_DOCTYPE["Sales Credit Note"],
+	"Purchase Invoice": ATTACHMENT_PREFIX_BY_DOCTYPE["Purchase Credit Note"],
+}
+
+
+def _get_attachment_prefix(attached_to_doctype, attached_to_name):
+	"""ERPNext has no separate credit-note doctypes: a credit note is a Sales or
+	Purchase Invoice saved with the 'Is Return' checkbox, so the doctype alone
+	can't distinguish the two - the parent's is_return flag has to be consulted."""
+	return_prefix = RETURN_PREFIX_BY_DOCTYPE.get(attached_to_doctype)
+	if (
+		return_prefix
+		and attached_to_name
+		and frappe.db.get_value(attached_to_doctype, attached_to_name, "is_return")
+	):
+		return return_prefix
+	return ATTACHMENT_PREFIX_BY_DOCTYPE.get(attached_to_doctype)
+
+
 def _base_attachment_name(attached_to_doctype, attached_to_name):
 	base_name = _slugify(attached_to_name)
-	prefix = ATTACHMENT_PREFIX_BY_DOCTYPE.get(attached_to_doctype)
+	prefix = _get_attachment_prefix(attached_to_doctype, attached_to_name)
 	if prefix:
 		base_name = f"{prefix}-{base_name}"
 	return base_name
@@ -79,7 +99,7 @@ def build_attachment_name(file_doc):
 	attached_to_name = getattr(file_doc, "attached_to_name", None)
 	attached_to_doctype = getattr(file_doc, "attached_to_doctype", None)
 	if attached_to_name:
-		prefix = ATTACHMENT_PREFIX_BY_DOCTYPE.get(attached_to_doctype)
+		prefix = _get_attachment_prefix(attached_to_doctype, attached_to_name)
 		base_name = _base_attachment_name(attached_to_doctype, attached_to_name)
 		ext = os.path.splitext(getattr(file_doc, "file_name", "") or "")[1] or ".pdf"
 		if not ext:
