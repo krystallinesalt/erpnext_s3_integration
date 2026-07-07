@@ -9,4 +9,6 @@ erpnext_s3_integration.patches.v16_0.add_pdf_copy_purchase_order
 # ERPNext S3 Integration: Attachments card (tracking doctype, hide old field, backfill history)
 erpnext_s3_integration.patches.v16_0.add_pdf_attachment_card_fields
 erpnext_s3_integration.patches.v16_0.backfill_pdf_attachment_history
+# ERPNext S3 Integration: Track legacy attachments (sidebar / removed custom fields) in the card
+erpnext_s3_integration.patches.v16_0.backfill_legacy_pdf_attachments
 # Patches added in this section will be executed after doctypes are migrated
